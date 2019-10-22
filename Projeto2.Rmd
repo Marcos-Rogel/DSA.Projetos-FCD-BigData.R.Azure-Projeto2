@@ -1,0 +1,25 @@
+---
+title: "Projeto com Feedback 2"
+author: "Marcos Rogel Pacheco dos Reis"
+Date: "21 de Outubro de 2019"
+output:
+  html_document:
+    number_sections: true
+    code_folding: hide
+    toc: true
+    toc_depth: 6
+    fig_width: 10
+    highlight: tango
+    theme: united
+    smart: true
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+plot(cars)
+cars
+```
+
