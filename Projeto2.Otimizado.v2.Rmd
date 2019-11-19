@@ -1,0 +1,594 @@
+---
+title: "Projeto com Feedback 2"
+author: "Marcos Rogel Pacheco dos Reis"
+date: " 15 de Novembro de 2019"
+output: 
+  html_document:
+    number_sections: true
+    code_folding: show
+    toc: true
+    toc_depth: 6
+    fig_width: 10
+    highlight: tango
+    theme: united
+    smart: true
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+
+
+# Carregar Pacotes
+```{r echo=TRUE, warning=FALSE}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(knitr, tidyverse, highcharter, data.table, DT, skimr, gridExtra, corrplot, Matrix, xgboost, Metrics)
+
+
+```
+
+# Carregar dados
+```{r echo=TRUE, warning=FALSE, result='asis'}
+setwd("~/GitHub/DSA.Projetos-FCD-BigData.R.Azure-Projeto2")
+source("src/utils.R")
+input_df <- fread("train.csv",data.table = TRUE, blank.lines.skip = TRUE,
+                  select = c("Semana",'Cliente_ID', 'Producto_ID', 'Agencia_ID', 'Ruta_SAK', 'Demanda_uni_equil','Canal_ID'),
+                  colClasses = c(Semana = "factor",
+                                 Agencia_ID = "factor",
+                                 Canal_ID = "factor",
+                                 Ruta_SAK = "factor",
+                                 Cliente_ID = "factor",
+                                 Producto_ID = "factor"))
+
+
+```
+# Visualizar dados {.tabset .tabset-fade .tabset-pills}
+
+```{r echo=TRUE, warning=FALSE, result='asis'}
+datatable(head(input_df, 100), class = 'table-bordered table-condensed')
+```
+
+
+# Exibir tipos de dados
+```{r, result='asis', echo=TRUE}
+str(input_df)
+```
+
+# Quantidade de valores distintos das variáveis categóricas
+```{r echo=TRUE, warning=FALSE, result='asis'}
+cathegorical_vars <- c("Semana" ,"Agencia_ID" ,"Canal_ID" ,"Ruta_SAK" ,"Cliente_ID" ,"Producto_ID" )
+input_df[, lapply(.SD, uniqueN), .SDcols = cathegorical_vars] %>%
+  melt(variable.name = "columns", value.name = "values") %>%
+  ggplot(aes(reorder(columns, -values), values)) +
+  geom_bar(stat = "identity", fill = "steelblue") + 
+  scale_y_log10(breaks = c(50,100,250, 500, 10000, 50000)) +
+  geom_text(aes(label = values), vjust = 1.6, color = "white", size=3) +
+  theme_gray()+
+  labs(x = "Colunas", y = "Qtde. de Valores Únicos")
+```
+
+# Sumário dos dados do dataset
+```{r, result='asis', echo=TRUE}
+skim(input_df)
+```
+
+# Plot TOP 15 Ocorrências de variáveis categóricas
+```{r, result='asis', echo=TRUE}
+plots <- lapply(setdiff(cathegorical_vars,'Semana'), plotTopVars,input_df,TRUE,15)
+
+grid.arrange(grobs=plots,ncol = 2, nrow=3)
+
+```
+
+# Análise por semana
+```{r, result='asis', echo=TRUE}
+plotTopVars('Semana',input_df,FALSE,15,"Ocorrências por Semana")
+```
+
+# Correlação entre todas as variáveis
+
+Optou-se por realizar uma amostragem dos dados pois processar a correlação no conjunto inteiro de dados fazia a máquina travar.
+```{r echo=FALSE, warning=FALSE, result='asis'}
+rm(input_df)
+invisible(gc())
+input_df <- fread("train.csv",data.table = TRUE, blank.lines.skip = TRUE, 
+                  select = c(cathegorical_vars,"Demanda_uni_equil"))
+
+
+input_df %>% dplyr::sample_frac(.5) %>% cor(method = "spearman") %>% corrplot(type = 'lower', method = 'number', tl.col = 'black', diag= F)
+
+invisible(gc())
+```
+
+# Definir dados de Treino e de Teste
+
+Uma vez que não se possui acesso aos resultados das previsões do dataset  "test.csv" fornecido , optou-se por utilizar apenas os dados do arquivo "train.csv" para a construção do modelo, fornecendo assim uma possibilidade de se avaliar a previsão fornecida pelo modelo resultante. Contudo prezou-se em manter a mesma estrutura e lógicas existentes nos datasets originais.
+
+## Visualizando dados do arquivo "test.csv"
+
+Para reproduzir o comportamento do dataset de teste original é necessário, primeiramente, compreendê-lo e captar suas características de modo a reproduzi-las.
+
+```{r, result='asis', echo=TRUE}
+original_train_df <- fread("test.csv",data.table = TRUE, blank.lines.skip = TRUE) 
+datatable(head(original_train_df, 100), class = 'table-bordered table-condensed')
+```
+
+## Quantidade de valores distintos da variável Semana
+```{r, result='asis', echo=TRUE}
+plotTopVars('Semana',original_train_df,FALSE,15,"Ocorrências por Semana")
+```
+
+## Criando dados de treino e de teste a partir do dataset de entrada (dataset de treino original)
+
+O dataset de teste original possui apenas as colunas "id, "Semana",'Cliente_ID', 'Producto_ID', 'Agencia_ID', 'Ruta_SAK' e 'Canal_ID', com isto para simular a previsão utilizando apenas o dataset de treino original, selecionou-se apenas as colunas em comum entre treino e teste originais.
+
+O dataset de test original possui as demandas das semanas 11 e 12 a serem previstas, . Para simular esta previsão utilizando apenas o dataset de treino original, dividiu-se o dataset de treino original em semanas 3 a 7 para o treino e semanas 8 e 9 para teste ( o que deverá ser previsto).
+
+```{r, result='asis', echo=TRUE}
+train <- input_df[Semana <=7]
+test<-input_df[Semana > 7,]
+rm(input_df)
+
+invisible(gc())
+```
+
+# Feature Engeneering
+
+## Quantidade de produto entregue nas semanas anteriores
+
+Adicinou-se uma feature que indica a quantidade de produto que foi entregue na(s) semana(s) anterior(es), optou-se por adicionar o histórico de entregas de 3 semanas uma vez que este foi o limite suportado pelo hardware da máquina que processou o modelo.
+
+As Semanas existentes no dataset de treino vão de 3 a 7, sendo a sétima a ultima semana. Cria-se  3 features, cada uma indicando  a quantidade de vendas nas 3 semanas semanas anteriores a sétima.
+
+```{r, message=FALSE, warning=FALSE, results='hide', echo=TRUE}
+
+train <- train[Semana > 3,]
+
+invisible(gc())
+
+data1<-train[,.(Semana=Semana+1,Cliente_ID,Producto_ID,Demanda_uni_equil)]
+train <- merge(train,data1[Semana>6,.(Demanda_uni_equil_lag_1=mean(Demanda_uni_equil)), by=.(Semana,Cliente_ID,Producto_ID)],all.x=T, by=c("Semana","Cliente_ID","Producto_ID"))
+
+
+test <- merge(test,data1[Semana>7,.(Demanda_uni_equil_lag_1=mean(Demanda_uni_equil)), by=.(Semana,Cliente_ID,Producto_ID)],all.x=T, by=c("Semana","Cliente_ID","Producto_ID"))
+
+data1<-train[,.(Semana=Semana+2,Cliente_ID,Producto_ID,Demanda_uni_equil)]
+train <- merge(train,data1[Semana>6,.(Demanda_uni_equil_lag_2=mean(Demanda_uni_equil)), by=.(Semana,Cliente_ID,Producto_ID)],all.x=T, by=c("Semana","Cliente_ID","Producto_ID"))
+
+test <- merge(test,data1[Semana>7,.(Demanda_uni_equil_lag_2=mean(Demanda_uni_equil)), by=.(Semana,Cliente_ID,Producto_ID)],all.x=T, by=c("Semana","Cliente_ID","Producto_ID"))
+
+data1<-train[,.(Semana=Semana+3,Cliente_ID,Producto_ID,Demanda_uni_equil)]
+train <- merge(train,data1[Semana>6,.(Demanda_uni_equil_lag_3=mean(Demanda_uni_equil)), by=.(Semana,Cliente_ID,Producto_ID)],all.x=T, by=c("Semana","Cliente_ID","Producto_ID"))
+
+test <- merge(test,data1[Semana>7,.(Demanda_uni_equil_lag_3=mean(Demanda_uni_equil)), by=.(Semana,Cliente_ID,Producto_ID)],all.x=T, by=c("Semana","Cliente_ID","Producto_ID"))
+
+train <- train[Semana > 6]
+head(train)
+
+rm(data1)
+invisible(gc())
+```
+### Dados de treino
+```{r, result='asis', echo=TRUE}
+datatable(head(train, 100), class = 'table-bordered table-condensed')
+```
+
+### Dados de teste
+```{r, result='asis', echo=TRUE}
+datatable(head(test, 100), class = 'table-bordered table-condensed')
+```
+
+## Contagens das ocorrências de cada valor das variáveis categóricas
+
+Efetua-se primeiramente uma contagem agrupada por semana e logo após obtêmm-se uma média geral das contagens de cada variável categórica no decorrer de todas as semanas.
+
+```{r warning=FALSE, include=FALSE, result='asis'}
+
+for (i in 1:length(setdiff(cathegorical_vars,"Semana"))) {
+  print(i)
+  x <- setdiff(cathegorical_vars,"Semana")[i]
+  countVarName <- paste("avgCount",x, sep="_")
+  countVarNameTemp <- paste(countVarName,"temp",sep="_")
+  group = c(x,'Semana')
+  
+  train[,(countVarNameTemp) := .N, by = group][,
+                                               (countVarName) := mean(get(countVarNameTemp),na.rm=T), by = x][
+                                                 ,(countVarNameTemp) := NULL]
+  
+  test[,(countVarNameTemp) := .N, by = group][,
+                                              (countVarName) := mean(get(countVarNameTemp),na.rm=T), by = x][
+                                                ,(countVarNameTemp) := NULL]
+  
+  test <- merge(test, train[, .( trainVarCount = mean(get(countVarName))), by=group,with=TRUE] ,all.x=T, by=group)
+  test[is.na(trainVarCount), trainVarCount:=0]
+  test[is.na(get(countVarName)), (countVarName):=0]
+  test[,(countVarName):=trainVarCount+get(countVarName)][,trainVarCount := NULL]
+}
+
+colorder <- colnames(train)
+setcolorder(test, colorder)
+```
+
+### Dados de treino
+```{r, result='asis', echo=TRUE}
+datatable(head(train, 100), class = 'table-bordered table-condensed')
+```
+
+### Dados de teste
+```{r, result='asis', echo=TRUE}
+datatable(head(test, 100), class = 'table-bordered table-condensed')
+```
+
+## Ajuste para o cálculo da RMSLE
+
+```{r, result='asis', echo=TRUE}
+train$Demanda_uni_equil=log(train$Demanda_uni_equil+1)
+
+write.csv(train,"train_transformed.csv",row.names = F)
+write.csv(test,"test_transformed.csv",row.names = F)
+
+rm(train)
+rm(test)
+invisible(gc())
+```
+
+
+#  Treinar modelo com valores padrão, sem tunning
+```{r echo=TRUE, message=TRUE, warning=FALSE, result='asis'}
+train <- fread("train_transformed.csv",data.table = TRUE, blank.lines.skip = TRUE)
+
+dtrain <- data.table(train %>% dplyr::sample_frac(.8))
+sid<-as.numeric(rownames(dtrain)) # because rownames() returns character
+dvalid<-train[-sid,]
+rm(sid)
+rm(train)
+invisible(gc())
+#matriz de treino
+dtrain <- xgb.DMatrix(as.matrix(dtrain[, -c("Demanda_uni_equil")]), 
+                      label = dtrain$Demanda_uni_equil)
+
+#matriz de validação
+dvalid <- xgb.DMatrix(as.matrix(dvalid[, -c("Demanda_uni_equil")]), 
+                      label = dvalid$Demanda_uni_equil);
+
+
+clf <- xgb.train(params=list(  objective="reg:linear", 
+                               booster = "gbtree",
+                               eta=0.1, 
+                               max_depth=10, 
+                               subsample=0.85,
+                               colsample_bytree=0.7) ,
+                 data = dtrain, 
+                 nrounds = 75, 
+                 verbose = 0,
+                 seed = 23,
+                 print_every_n=5,
+                 early_stopping_rounds    = 10,
+                 watchlist           = list(valid = dvalid),
+                 maximize            = FALSE,
+                 eval_metric='rmse'
+)
+
+
+bestScore <-clf[["best_score"]][["valid-rmse"]]
+bestModel <- clf
+print(paste("best score:",bestScore))
+```
+
+
+### Importância das Variáveis no modelo inicial
+```{r, result='asis', echo=TRUE}
+xgb.plot.importance(xgb.importance(model=clf))
+```
+
+# Tunning do modelo
+
+## Função Genérica de Tunning
+
+```{r, result='asis', echo=TRUE}
+
+xgbParameterTunning <-
+  function(gridOfParametersToTune,
+           dtrain,
+           dvalid,
+           nrounds,
+           seed,
+           previusBestModel) {
+    modelList <- NULL
+    
+    for (i in 1:nrow(eg)) {
+      
+      max_depth = gridOfParametersToTune[i, "max_depth"]
+      min_child_weight = gridOfParametersToTune[i, "min_child_weight"]
+      subsample = gridOfParametersToTune[i, "subsample"]
+      colsample_bytree = gridOfParametersToTune[i, "colsample_bytree"]
+      gamma = gridOfParametersToTune[i, "gamma"]
+      reg_alpha = gridOfParametersToTune[i, "reg_alpha"]
+      eta = gridOfParametersToTune[i, "eta"]
+      
+      if (!is.null(previusBestModel)) {
+        max_depth = ifelse(is.null(max_depth),
+                           previusBestModel$params$max_depth,
+                           max_depth)
+        min_child_weight = ifelse(
+          is.null(min_child_weight),
+          previusBestModel$params$min_child_weight,
+          min_child_weight
+        )
+        subsample = ifelse(is.null(subsample),
+                           previusBestModel$params$subsample,
+                           subsample)
+        colsample_bytree = ifelse(
+          is.null(colsample_bytree),
+          previusBestModel$params$colsample_bytree,
+          colsample_bytree
+        )
+        gamma = ifelse(is.null(gamma), previusBestModel$params$gamma, gamma)
+        reg_alpha = ifelse(is.null(reg_alpha),
+                           previusBestModel$params$reg_alpha,
+                           reg_alpha)
+        eta = ifelse(is.null(eta), previusBestModel$params$eta, eta)
+      }
+      
+      
+      clf <- xgb.train(
+        params = list(
+          objective = "reg:linear",
+          booster = "gbtree",
+          eta = ifelse(is.null(eta), 0.3, eta) ,
+          max_depth = ifelse(is.null(max_depth), 6, max_depth) ,
+          subsample = ifelse(is.null(subsample), 1, subsample) ,
+          colsample_bytree = ifelse(is.null(colsample_bytree), 1, colsample_bytree) ,
+          min_child_weight = ifelse(is.null(min_child_weight), 1, min_child_weight),
+          gamma = ifelse(is.null(gamma), 0, gamma),
+          reg_alpha = ifelse(is.null(reg_alpha), 0, reg_alpha)
+        ) ,
+        data = dtrain,
+        nrounds = nrounds,
+        verbose = 0,
+        seed = seed,
+        print_every_n = 5,
+        early_stopping_rounds    = 10,
+        watchlist           = list(valid = dvalid),
+        maximize            = FALSE,
+        eval_metric = 'rmse'
+      )
+      
+      modelList[[i]] <- clf
+      
+    }
+    
+    
+    bestScore <- 100000
+    bestModel <- NULL
+    
+    for (i in 1:length(modelList)) {
+      score = modelList[[i]][["best_score"]][["valid-rmse"]]
+      if (score < bestScore) {
+        bestScore <- score
+        
+        bestModel <- modelList[[i]]
+      }
+      
+    }
+    
+    conv <-
+      data.frame(
+        iter = 1:length(bestModel$evaluation_log$valid_rmse),
+        valid_auc = bestModel$evaluation_log$valid_rmse
+      )
+    conv <- melt(conv, id.vars = "iter")
+    plot <- ggplot(data = conv) + geom_line(aes(x = iter, y = value)) +
+      labs(x = "Nº Iteração", y = "valor da RMSE") +
+      theme(plot.title = element_text(hjust =  0.5))
+    plot
+    
+    return(bestModel)
+  }
+
+```
+
+## Tune max_depth e min_child_weight
+
+```{r, result='asis', echo=TRUE}
+
+bestModel <- NULL
+nrounds <- 75
+seed <- 1
+
+eg <- expand.grid(
+  max_depth = seq(3,10,2),
+  min_child_weight = seq(1,6,2)
+)
+
+datatable(eg, class = 'table-bordered table-condensed')
+
+system.time(bestModel<-xgbParameterTunning(eg,dtrain,dvalid,nrounds,seed,bestModel))
+print(paste("best score:",bestModel$best_score))
+print(paste("max_depth:", bestModel$params$max_depth))
+print(paste("min_child_weight:", bestModel$params$min_child_weight))
+
+```
+
+## Tunnig fino de max_depth e min_child_weight
+
+```{r, result='asis', echo=TRUE}
+
+eg <- expand.grid(
+  max_depth = c(bestModel$params$max_depth-1,bestModel$params$max_depth,bestModel$params$max_depth+1),
+  min_child_weight = c(bestModel$params$min_child_weight-1,bestModel$params$min_child_weight,bestModel$params$min_child_weight+1)
+)
+
+datatable(eg, class = 'table-bordered table-condensed')
+
+system.time(bestModel<-xgbParameterTunning(eg,dtrain,dvalid,nrounds,seed,bestModel))
+print(paste("best score:",bestModel$best_score))
+print(paste("max_depth:", bestModel$params$max_depth))
+print(paste("min_child_weight:", bestModel$params$min_child_weight))
+```
+
+## Tunning gamma
+
+```{r, result='asis', echo=TRUE}
+
+eg <- expand.grid(
+  gamma =c(0,0.1,1,10,100)
+)
+
+datatable(eg, class = 'table-bordered table-condensed')
+
+system.time(bestModel<-xgbParameterTunning(eg,dtrain,dvalid,nrounds,seed,bestModel))
+print(paste("best score:",bestModel$best_score))
+print(paste("gamma:", bestModel$params$gamma))
+```
+
+## Tuning subsample e colsample_bytree
+
+```{r, result='asis', echo=TRUE}
+
+eg <- expand.grid(
+  subsample = seq(0.6,0.9,0.1),
+  colsample_bytree =  seq(0.6,0.9,0.1)
+)
+
+datatable(eg, class = 'table-bordered table-condensed')
+
+system.time(bestModel<-xgbParameterTunning(eg,dtrain,dvalid,nrounds,seed,bestModel))
+print(paste("best score:",bestModel$best_score))
+print(paste("subsample:", bestModel$params$subsample))
+print(paste("colsample_bytree:", bestModel$params$colsample_bytree))
+
+```
+
+## Tunning reg_alpha
+
+```{r, result='asis', echo=TRUE}
+
+eg <- expand.grid(
+  reg_alpha = c(0,1e-5, 1e-2, 0.1, 1, 100)
+)
+
+datatable(eg, class = 'table-bordered table-condensed')
+
+system.time(bestModel<-xgbParameterTunning(eg,dtrain,dvalid,nrounds,seed,bestModel))
+print(paste("best score:",bestModel$best_score))
+print(paste("reg_alpha:", bestModel$params$reg_alpha))
+
+```
+
+## Tunning eta
+
+```{r, result='asis', echo=TRUE}
+eg <- expand.grid(
+  eta = c(0.05,0.1,0.2,0.5,1)
+)
+
+datatable(eg, class = 'table-bordered table-condensed')
+
+system.time(bestModel<-xgbParameterTunning(eg,dtrain,dvalid,nrounds,seed,bestModel))
+print(paste("best score:",bestModel$best_score))
+print(paste("eta:", bestModel$params$eta))
+```
+
+
+## Modelo após tunning
+
+```{r, result='asis', echo=TRUE}
+nrounds <- 150
+eg <- data.frame(a=c(1))
+
+system.time(system.time(bestModel<-xgbParameterTunning(eg,dtrain,dvalid,nrounds,seed,bestModel)))
+
+as.data.frame(bestModel$params)
+
+print(paste("best score:",bestModel$best_score))
+print(paste("best_iteration:",bestModel$best_iteration))
+print(paste("nfeatures:",bestModel$nfeatures))
+print(paste("best_ntreelimit:",bestModel$best_ntreelimit))
+
+```
+
+## Importância das Variáveis após tunning
+
+```{r, result='asis', echo=TRUE}
+
+xgb.plot.importance(xgb.importance(model=bestModel))
+```
+
+# Prevendo resultados
+
+Primeiramente realiza-se a previsão da demanda na semana 8 que será utilizada como subsídio para realizar a previsão da demanada na semana 9.
+
+## Prevendo resultados para a demanada da semana 8
+
+```{r, result='asis', echo=TRUE}
+rm(dtrain)
+rm(dvalid)
+invisible(gc)
+
+test <- fread("test_transformed.csv",data.table = TRUE, blank.lines.skip = TRUE)
+test$ID <- 1:nrow(test)
+
+correctPredictionsWeek8 <- setorder(test[Semana==8,c("ID","Demanda_uni_equil")],"ID")
+correctPredictionsWeek9 <- setorder(test[Semana==9,c("ID","Demanda_uni_equil")],"ID")
+
+correctPredictionsWeek8 <- as.matrix(correctPredictionsWeek8[,c("Demanda_uni_equil")])
+correctPredictionsWeek9 <- as.matrix(correctPredictionsWeek9[,c("Demanda_uni_equil")])
+
+input_to_predict_week_8 = test[Semana ==8,]
+
+setcolorder(input_to_predict_week_8, colorder)
+
+setorder(input_to_predict_week_8,"ID")
+
+input_to_predict_week_8 <- xgb.DMatrix(as.matrix(input_to_predict_week_8[, -c("ID","Demanda_uni_equil")]),missing = NA)
+pred_week_8 <- predict(bestModel,input_to_predict_week_8)
+pred_week_8 <- exp(round(pred_week_8,5))-1
+```
+
+## Prevendo resultados para a demanada da semana 9
+
+```{r, result='asis', echo=TRUE}
+
+week9_lag1_demanda <- test[Semana ==8,.(ID,Cliente_ID,Producto_ID)]
+week9_lag1_demanda$Demanda_uni_equil_lag_1 <- pred_week_8
+week9_lag1_demanda <- week9_lag1_demanda[,.(Demanda_uni_equil_lag_1=mean(Demanda_uni_equil_lag_1)), by=.(Cliente_ID,Producto_ID)]
+
+input_to_predict_week_9 <- test[Semana ==9,]
+input_to_predict_week_9[, Demanda_uni_equil_lag_1 := NULL] 
+
+input_to_predict_week_9 <- merge(input_to_predict_week_9,week9_lag1_demanda,all.x=T,by=c('Cliente_ID','Producto_ID'))
+
+rm(test)
+invisible(gc)
+
+setcolorder(input_to_predict_week_9, colorder)
+
+setorder(input_to_predict_week_9,"ID")
+
+input_to_predict_week_9 <- xgb.DMatrix(as.matrix(input_to_predict_week_9[, -c("ID","Demanda_uni_equil")]),missing = NA)
+
+pred_week_9 <- predict(bestModel,input_to_predict_week_9)
+pred_week_9 <- exp(round(pred_week_9,5))-1
+```
+
+## Realizar predições e avaliar resultados
+
+```{r, result='asis', echo=TRUE}
+
+predicted <- c(pred_week_8,pred_week_9)
+
+expected <- c(correctPredictionsWeek8,correctPredictionsWeek9)
+
+paste('rmsle:', rmsle(expected,predicted))
+
+# Computando os resíduos
+inframe <- data.table(predicted, expected)
+inframe <-  mutate(inframe, resids = predicted - expected)
+
+# Plotando os resíduos
+qqnorm(inframe$resids)
+qqline(inframe$resids)
+
+```
+
